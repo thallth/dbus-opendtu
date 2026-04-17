@@ -98,6 +98,35 @@ def mocked_requests_get(url, params=None, **kwargs):  # pylint: disable=unused-a
         with open(json_file_path, 'r', encoding="UTF-8") as file:
             json_data = json.load(file)
         return MockResponse(json_data, 200)
+    elif url == 'http://localhost/api/limit/status':
+        json_file_path = os.path.join(os.path.dirname(__file__), '../docs/opendtu_limit_status.json')
+        with open(json_file_path, 'r', encoding="UTF-8") as file:
+            json_data = json.load(file)
+        return MockResponse(json_data, 200)
+    elif url.startswith('http://localhost/api/devinfo/status?inv='):
+        json_file_path = os.path.join(os.path.dirname(__file__), '../docs/opendtu_devinfo_status.json')
+        with open(json_file_path, 'r', encoding="UTF-8") as file:
+            json_data = json.load(file)
+        return MockResponse(json_data, 200)
+    return MockResponse(None, 404)
+
+
+def mocked_requests_post(url, data=None, **kwargs):  # pylint: disable=unused-argument
+    """Mock `requests.post` for OpenDTU /api/limit/config."""
+    class MockResponse:
+        def __init__(self, json_data, status_code):
+            self.json_data = json_data
+            self.status_code = status_code
+
+        def json(self):
+            return self.json_data
+
+        def raise_for_status(self):
+            if self.status_code != 200:
+                raise requests.exceptions.HTTPError(f"{self.status_code} Error")
+
+    if url == 'http://localhost/api/limit/config':
+        return MockResponse({"type": "success", "message": "Settings saved!"}, 200)
     return MockResponse(None, 404)
 
 
@@ -452,6 +481,274 @@ class ReconnectLogicTest(unittest.TestCase):
             self.assertEqual(service.retry_after_seconds, 123)
             self.assertEqual(service.min_retries_until_fail, 7)
             self.assertEqual(service.error_state_after_seconds, 456)
+
+
+class PowerLimitTest(unittest.TestCase):
+    """Tests for OpenDTU power-limit integration."""
+
+    def setUp(self):
+        DbusService._meter_data = None
+
+    def tearDown(self):
+        DbusService._meter_data = None
+
+    opendtu_config = {
+        "DEFAULT": {
+            "DTU": "opendtu",
+            "Username": "admin",
+            "Password": "secret",
+        },
+        "INVERTER0": {
+            "Phase": "L1",
+            "DeviceInstance": "34",
+            "AcPosition": "1",
+            "Host": "localhost",
+        },
+    }
+
+    def _make_service(self):
+        service = DbusService("com.victronenergy.pvinverter", 0)
+        # _dbusservice is a MagicMock by default; swap for a real dict for path I/O
+        service._dbusservice = {
+            "/Ac/MaxPower": None,
+            "/Ac/PowerLimit": None,
+            "/StatusCode": 7,
+        }
+        service.serial = "114182940773"
+        return service
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_refresh_limit_status_publishes_max_power(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """_refresh_limit_status populates /Ac/MaxPower and /Ac/PowerLimit."""
+        DbusService._meter_data = None
+        service = self._make_service()
+        service._refresh_limit_status()
+        self.assertEqual(service._dbusservice["/Ac/MaxPower"], 2000)
+        # limit_relative=50 and max_power=2000 -> 1000W initial PowerLimit
+        self.assertEqual(service._dbusservice["/Ac/PowerLimit"], 1000.0)
+        self.assertEqual(service._dbusservice["/StatusCode"], 7)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    def test_refresh_limit_status_maps_error_status(
+            self, mock_logging, mock_dbus, mock_config):
+        """Non-Ok limit_set_status maps to STATUSCODE_ERROR on /StatusCode."""
+        failing_payload = {
+            "114182940773": {"limit_relative": 50, "max_power": 2000, "limit_set_status": "Failure"}
+        }
+
+        def failing_get(url, **_kwargs):
+            if url.endswith("/livedata/status"):
+                return mocked_requests_get(url)
+            if url.endswith("/limit/status"):
+                class R:
+                    status_code = 200
+                    def json(self):
+                        return failing_payload
+                    def raise_for_status(self):
+                        pass
+                return R()
+            return mocked_requests_get(url)
+
+        DbusService._meter_data = None
+        with patch('dbus_service.requests.get', side_effect=failing_get):
+            service = self._make_service()
+            service._refresh_limit_status()
+        self.assertEqual(service._dbusservice["/StatusCode"], 10)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    @patch('dbus_service.requests.post', side_effect=mocked_requests_post)
+    def test_apply_power_limit_posts_and_accepts(
+            self, mock_post, mock_get, mock_logging, mock_dbus, mock_config):
+        """Writing /Ac/PowerLimit POSTs the correct payload and the change is accepted."""
+        DbusService._meter_data = None
+        service = self._make_service()
+        # _refresh_limit_status needs a populated MaxPower for clamp logic; set directly
+        service._dbusservice["/Ac/MaxPower"] = 2000
+        accepted = service._handlechangedvalue("/Ac/PowerLimit", 300)
+        self.assertTrue(accepted)
+        self.assertEqual(mock_post.call_count, 1)
+        call_url = mock_post.call_args.kwargs.get("url") or mock_post.call_args.args[0]
+        self.assertEqual(call_url, "http://localhost/api/limit/config")
+        form = mock_post.call_args.kwargs["data"]
+        self.assertEqual(json.loads(form["data"]),
+                         {"serial": "114182940773", "limit_type": 0, "limit_value": 300})
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    @patch('dbus_service.requests.post', side_effect=requests.exceptions.ConnectionError("boom"))
+    def test_apply_power_limit_rejects_on_post_failure(
+            self, mock_post, mock_get, mock_logging, mock_dbus, mock_config):
+        """A failing POST causes _handlechangedvalue to return False (DBus write rejected)."""
+        DbusService._meter_data = None
+        service = self._make_service()
+        service._dbusservice["/Ac/MaxPower"] = 2000
+        accepted = service._handlechangedvalue("/Ac/PowerLimit", 500)
+        self.assertFalse(accepted)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_fetch_opendtu_devinfo_builds_url_and_returns_json(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """fetch_opendtu_devinfo calls /api/devinfo/status?inv=<serial> and returns parsed JSON."""
+        DbusService._meter_data = None
+        service = self._make_service()
+        data = service.fetch_opendtu_devinfo("114182940773")
+        self.assertEqual(data["hw_model_name"], "HMS-2000-4T")
+        self.assertEqual(data["fw_build_version"], 10027)
+        called_urls = [c.kwargs.get("url") or (c.args[0] if c.args else None)
+                       for c in mock_get.call_args_list]
+        self.assertIn("http://localhost/api/devinfo/status?inv=114182940773", called_urls)
+
+    def test_decode_version_int_and_string(self):
+        """Int versions split into 2-digit groups; strings pass through."""
+        self.assertEqual(DbusService._decode_version(10027), "1.0.27")
+        self.assertEqual(DbusService._decode_version(101), "0.1.1")
+        self.assertEqual(DbusService._decode_version("01.10"), "01.10")
+        self.assertIsNone(DbusService._decode_version(None))
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_init_uses_devinfo_for_management_paths(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """At init, /ProductName, /FirmwareVersion, /HardwareVersion come from devinfo."""
+        DbusService._meter_data = None
+        service = DbusService("com.victronenergy.pvinverter", 0)
+        by_path = {c.args[0]: c.args[1] for c in service._dbusservice.add_path.call_args_list}
+        self.assertEqual(by_path["/ProductName"], "HMS-2000-4T")
+        self.assertEqual(by_path["/FirmwareVersion"], "1.0.27 (2023-06-05 10:24:00)")
+        self.assertEqual(by_path["/HardwareVersion"], "01.10")
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    def test_init_valid_data_false_sets_status_error(
+            self, mock_logging, mock_dbus, mock_config):
+        """valid_data=false in devinfo makes initial /StatusCode = ERROR."""
+        from constants import STATUSCODE_ERROR
+
+        def routed_get(url, **_kw):
+            if url.startswith("http://localhost/api/devinfo/status"):
+                class R:
+                    status_code = 200
+                    def json(self):
+                        return {"valid_data": False, "hw_model_name": "HMS-2000-4T",
+                                "hw_version": "01.10", "fw_build_version": 10027,
+                                "fw_build_datetime": "2023-06-05 10:24:00"}
+                    def raise_for_status(self):
+                        pass
+                return R()
+            return mocked_requests_get(url)
+
+        DbusService._meter_data = None
+        with patch('dbus_service.requests.get', side_effect=routed_get):
+            service = DbusService("com.victronenergy.pvinverter", 0)
+        by_path = {c.args[0]: c.args[1] for c in service._dbusservice.add_path.call_args_list}
+        self.assertEqual(by_path["/StatusCode"], STATUSCODE_ERROR)
+
+
+class PvInverterSchemaTest(unittest.TestCase):
+    """PVINVERTER_PATHS/VICTRON_PATHS separation and /Position + /PositionIsAdjustable."""
+
+    def test_pvinverter_paths_exclude_inverter_only(self):
+        from constants import PVINVERTER_PATHS, VICTRON_PATHS
+        self.assertNotIn("/Ac/Out/L1/I", PVINVERTER_PATHS)
+        self.assertNotIn("/Dc/0/Voltage", PVINVERTER_PATHS)
+        # VICTRON_PATHS is the superset used by the inverter service
+        self.assertIn("/Ac/Out/L1/I", VICTRON_PATHS)
+        self.assertIn("/Dc/0/Voltage", VICTRON_PATHS)
+        # Shared pvinverter paths appear in both
+        self.assertIn("/Ac/MaxPower", PVINVERTER_PATHS)
+        self.assertIn("/Ac/PowerLimit", PVINVERTER_PATHS)
+
+    opendtu_config = {
+        "DEFAULT": {"DTU": "opendtu"},
+        "INVERTER0": {
+            "Phase": "L1", "DeviceInstance": "34", "AcPosition": "1", "Host": "localhost",
+        },
+    }
+
+    def setUp(self):
+        DbusService._meter_data = None
+
+    def tearDown(self):
+        DbusService._meter_data = None
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_pvinverter_registers_position_paths(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """Pvinverter service registers /Position and /PositionIsAdjustable=1."""
+        service = DbusService("com.victronenergy.pvinverter", 0)
+        registered_paths = [call.args[0] for call in service._dbusservice.add_path.call_args_list]
+        self.assertIn("/Position", registered_paths)
+        self.assertIn("/PositionIsAdjustable", registered_paths)
+        # /PositionIsAdjustable is registered with initial=1
+        position_adj_call = next(c for c in service._dbusservice.add_path.call_args_list
+                                 if c.args[0] == "/PositionIsAdjustable")
+        self.assertEqual(position_adj_call.args[1], 1)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_init_status_code_is_startup(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """Initial /StatusCode is STARTUP(0), not RUNNING(7)."""
+        from constants import STATUSCODE_STARTUP
+        service = DbusService("com.victronenergy.pvinverter", 0)
+        status_calls = [c for c in service._dbusservice.add_path.call_args_list
+                        if c.args[0] == "/StatusCode"]
+        self.assertEqual(status_calls[0].args[1], STATUSCODE_STARTUP)
+
+
+class ComputeStatusCodeTest(unittest.TestCase):
+    """Tests for _compute_status_code mapping reachable/producing onto StatusCode."""
+
+    def setUp(self):
+        DbusService._meter_data = None
+
+    def tearDown(self):
+        DbusService._meter_data = None
+
+    def _make(self, dtuvariant):
+        service = DbusService(servicename="testing", actual_inverter=0)
+        service.dtuvariant = dtuvariant
+        return service
+
+    def test_opendtu_reachable_and_producing_is_running(self):
+        from constants import STATUSCODE_RUNNING
+        service = self._make("opendtu")
+        service.set_test_data({"inverters": [{"reachable": True, "producing": True}]})
+        self.assertEqual(service._compute_status_code(), STATUSCODE_RUNNING)
+
+    def test_opendtu_reachable_not_producing_is_standby(self):
+        from constants import STATUSCODE_STANDBY
+        service = self._make("opendtu")
+        service.set_test_data({"inverters": [{"reachable": True, "producing": False}]})
+        self.assertEqual(service._compute_status_code(), STATUSCODE_STANDBY)
+
+    def test_opendtu_unreachable_is_error(self):
+        from constants import STATUSCODE_ERROR
+        service = self._make("opendtu")
+        service.set_test_data({"inverters": [{"reachable": False, "producing": False}]})
+        self.assertEqual(service._compute_status_code(), STATUSCODE_ERROR)
 
 
 if __name__ == '__main__':

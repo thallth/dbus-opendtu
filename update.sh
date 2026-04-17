@@ -1,5 +1,5 @@
 # Set the repository name and username
-REPO="henne49/dbus-opendtu"
+REPO="thallth/dbus-opendtu"
 STARTUP_FILE="/data/rc.local"
 #!/bin/bash
 
@@ -67,9 +67,9 @@ else
   INSTALLED_VERSION="none"
 fi
 
-# delete old logs if they exist  
-if [ -f $SCRIPT_DIR/current.log ]; then  
-    rm $SCRIPT_DIR/current.log*  
+# delete old logs if they exist
+if [ -f $SCRIPT_DIR/current.log ]; then
+    rm $SCRIPT_DIR/current.log*
 fi
 
 # Check if the current folder has enough space for 5MB
@@ -94,7 +94,7 @@ if [ "$VERSION" = "latest" ]; then
   # Fetch the latest release information from the GitHub API
   # and extract the latest tag name using awk
   # Assuming GitHub API returns the latest release tag in the format "vX.X.X"
-  LATEST_TAG=$(curl -s https://api.github.com/repos/$REPO/releases/latest | 
+  LATEST_TAG=$(curl -s https://api.github.com/repos/$REPO/releases/latest |
                awk -F'"' '/tag_name/{print $4}')
   TAG=$LATEST_TAG
 else
@@ -103,8 +103,8 @@ else
     # Fetch the latest pre-release information from the GitHub API
     # and extract the latest pre-release tag name using awk
     # Assuming GitHub API returns pre-release tags in the format "vX.X.X-rc.X" or "vX.X.X-beta.X"
-    PRE_RELEASE_TAG=$(curl -s https://api.github.com/repos/$REPO/releases | 
-                      awk -F'"' '/tag_name/{print $4}' | 
+    PRE_RELEASE_TAG=$(curl -s https://api.github.com/repos/$REPO/releases |
+                      awk -F'"' '/tag_name/{print $4}' |
                       grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+$')
     TAG=$PRE_RELEASE_TAG
   else
@@ -171,4 +171,3 @@ $SCRIPT_DIR/install.sh
 
 #restart the service
 $SCRIPT_DIR/restart.sh
-
