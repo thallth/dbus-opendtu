@@ -674,6 +674,8 @@ class DbusService:
     def _compute_status_code(self):
         '''Map inverter reachable/producing state onto STATUSCODE_* (7/8/10).'''
         try:
+            if not self.is_data_up2date():
+                return constants.STATUSCODE_ERROR
             meter_data = self._get_data()
             if self.dtuvariant == constants.DTUVARIANT_OPENDTU:
                 inv = meter_data["inverters"][self.pvinverternumber]
@@ -714,11 +716,13 @@ class DbusService:
 
     def _refresh_and_update(self):
         """
-        Helper method to refresh data, handle data update if up-to-date, update index, and set successful flag.
+        Refresh data and publish it regardless of reachability/age. When the inverter
+        is offline (OpenDTU reachable=false, or Ahoy data older than max_age_ts)
+        we still want cumulative values (Energy/Forward) on DBus and /StatusCode
+        set to ERROR via _compute_status_code.
         """
         self._refresh_data()
-        if self.is_data_up2date():
-            self._handle_data_update()
+        self._handle_data_update()
         self._update_index()
         return True
 
@@ -976,7 +980,9 @@ class DbusService:
                 self._dbusservice["/Ac/L3/Power"] = powerthird
                 self._dbusservice["/Ac/Power"] = power
 
-                if power > 0:
+                # Energy/Forward is cumulative; publish every cycle so totals stay visible
+                # while the inverter is offline (e.g. at night).
+                if pvyield is not None:
                     self._dbusservice["/Ac/L1/Energy/Forward"] = pvyield / 3
                     self._dbusservice["/Ac/L2/Energy/Forward"] = pvyield / 3
                     self._dbusservice["/Ac/L3/Energy/Forward"] = pvyield / 3
@@ -988,7 +994,7 @@ class DbusService:
                 self._dbusservice[pre + "/Current"] = current
                 self._dbusservice[pre + "/Power"] = power
                 self._dbusservice["/Ac/Power"] = power
-                if power > 0:
+                if pvyield is not None:
                     self._dbusservice[pre + "/Energy/Forward"] = pvyield
                     self._dbusservice["/Ac/Energy/Forward"] = pvyield
 

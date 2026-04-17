@@ -418,8 +418,9 @@ class ReconnectLogicTest(unittest.TestCase):
         self.service.reset_statuscode_on_next_success = False
         self.service._refresh_data.side_effect = requests.exceptions.RequestException("Test exception")
         self.service.update()
-        # reset refresh_data to simulate a successful update
+        # reset refresh_data to simulate a successful update; inverter also reachable again
         self.service._refresh_data = MagicMock()
+        self.service.is_data_up2date = MagicMock(return_value=True)
         self.service.update()
         self.assertNotEqual(self.service._dbusservice['/StatusCode'], 10)
 
@@ -432,7 +433,6 @@ class ReconnectLogicTest(unittest.TestCase):
         self.service.is_data_up2date = MagicMock(return_value=True)
         self.service.update()
         self.service._refresh_data.assert_called_once()
-        self.service.is_data_up2date.assert_called_once()
         self.service.set_dbus_values.assert_called_once()
         self.service._update_index.assert_called_once()
         self.assertEqual(self.service.failed_update_count, 0)
@@ -452,7 +452,6 @@ class ReconnectLogicTest(unittest.TestCase):
         self.service._update_index = MagicMock()
         self.service.update()
         self.service._refresh_data.assert_called_once()
-        self.service.is_data_up2date.assert_called_once()
         self.service.set_dbus_values.assert_called_once()
         self.service._update_index.assert_called_once()
         self.assertEqual(self.service.failed_update_count, 0)
@@ -716,6 +715,47 @@ class PvInverterSchemaTest(unittest.TestCase):
         status_calls = [c for c in service._dbusservice.add_path.call_args_list
                         if c.args[0] == "/StatusCode"]
         self.assertEqual(status_calls[0].args[1], STATUSCODE_STARTUP)
+
+
+class OfflinePublishingTest(unittest.TestCase):
+    """Regression: at night (OpenDTU reachable=false) yield totals and StatusCode=ERROR
+    must still be written to DBus, not skipped."""
+
+    def setUp(self):
+        DbusService._meter_data = None
+
+    def tearDown(self):
+        DbusService._meter_data = None
+
+    def test_set_dbus_values_publishes_yield_and_error_when_offline(self):
+        from constants import STATUSCODE_ERROR
+        service = DbusService(servicename="testing", actual_inverter=0)
+        service.dtuvariant = "opendtu"
+        service._servicename = "com.victronenergy.pvinverter"
+        service.pvinverterphase = "L1"
+        service.useyieldday = False
+        service.dry_run = False
+        # Craft OpenDTU livedata with an unreachable, non-producing inverter that
+        # nevertheless still has a YieldTotal accumulated from earlier in the day.
+        service.set_test_data({
+            "inverters": [{
+                "serial": "114182000001",
+                "reachable": False,
+                "producing": False,
+                "AC": {"0": {"Power": {"v": 0}, "Voltage": {"v": 0}, "Current": {"v": 0},
+                             "YieldTotal": {"v": 12.345}}},
+                "DC": {"0": {"Voltage": {"v": 0}}},
+            }],
+        })
+        service._dbusservice = {p: None for p in [
+            "/Ac/Power", "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power",
+            "/Ac/L1/Energy/Forward", "/Ac/Energy/Forward", "/StatusCode",
+        ]}
+        service.set_dbus_values()
+        self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
+        self.assertEqual(service._dbusservice["/Ac/L1/Energy/Forward"], 12.345)
+        self.assertEqual(service._dbusservice["/Ac/Power"], 0)
+        self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_ERROR)
 
 
 class ComputeStatusCodeTest(unittest.TestCase):
