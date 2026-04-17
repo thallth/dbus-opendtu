@@ -511,15 +511,16 @@ class DbusService:
 
     def _refresh_limit_status(self):
         '''OpenDTU only: fetch /api/limit/status, publish /Ac/MaxPower,
-           and mirror limit_set_status to /StatusCode.'''
+           and mirror limit_set_status to /StatusCode. Returns the limit_set_status
+           string (or None) so callers can poll through a "Pending" phase.'''
         if self.dtuvariant != constants.DTUVARIANT_OPENDTU:
-            return
+            return None
         url = f"{self.get_opendtu_base_url()}/limit/status"
         status = self.fetch_url(url)
         entry = status.get(self.serial)
         if not entry:
             logging.warning(f"No limit status entry for serial {self.serial}")
-            return
+            return None
         max_power = entry.get("max_power")
         limit_relative = entry.get("limit_relative")
         if max_power is not None:
@@ -529,9 +530,33 @@ class DbusService:
         limit_set_status = entry.get("limit_set_status")
         if limit_set_status == "Ok":
             self._dbusservice["/StatusCode"] = constants.STATUSCODE_RUNNING
+        elif limit_set_status == "Pending":
+            # Transient: inverter hasn't acknowledged the new limit yet. Leave
+            # /StatusCode unchanged so callers can poll without flapping.
+            logging.debug(f"limit_set_status=Pending for serial {self.serial}")
         else:
             logging.warning(f"limit_set_status={limit_set_status} for serial {self.serial}")
             self._dbusservice["/StatusCode"] = constants.STATUSCODE_ERROR
+        return limit_set_status
+
+    def _wait_for_limit_settled(self, timeout=5.0, interval=0.5):
+        '''Poll _refresh_limit_status until limit_set_status leaves "Pending" or
+           timeout elapses. Returns the final status string (or None).'''
+        deadline = time.time() + timeout
+        status = None
+        while True:
+            try:
+                status = self._refresh_limit_status()
+            except Exception as error:
+                logging.warning(f"Limit status refresh failed during poll: {error}")
+                return status
+            if status != "Pending":
+                return status
+            if time.time() >= deadline:
+                logging.warning(
+                    f"limit_set_status still Pending after {timeout:.1f}s for serial {self.serial}")
+                return status
+            time.sleep(interval)
 
     def _apply_power_limit(self, watts):
         '''Write /Ac/PowerLimit -> POST /api/limit/config (absolute watts, non-persistent).
@@ -559,7 +584,7 @@ class DbusService:
             logging.warning(f"OpenDTU rejected limit: {response}")
             return False
         try:
-            self._refresh_limit_status()
+            self._wait_for_limit_settled()
         except Exception as error:
             logging.warning(f"Post-write limit status refresh failed: {error}")
         return True
