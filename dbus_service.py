@@ -118,6 +118,14 @@ class DbusService:
         # with real hardware/firmware metadata instead of placeholders.
         self.serial = self._get_serial(self.pvinverternumber)
         self.devinfo = self._fetch_devinfo_safe()
+        # Seed /Ac/MaxPower and /Ac/PowerLimit from OpenDTU before add_path; writing
+        # them later would emit PropertiesChanged and round-trip back as an external
+        # Set that our onchangecallback re-applies to OpenDTU, stomping on user limits.
+        limit_entry = self._fetch_limit_entry_safe()
+        initial_max_power, initial_power_limit = self._initial_power_limit_from_entry(limit_entry)
+        # If the initial fetch failed, _refresh_limit_status will seed these paths
+        # on its first successful call. Track the state so the seed fires at most once.
+        self._limit_seeded = limit_entry is not None
 
         product_name = (self.devinfo.get("hw_model_name") if self.devinfo else None) or self._get_name()
         firmware_version = self._format_firmware_version() or read_version('version.txt')
@@ -127,15 +135,18 @@ class DbusService:
                           if self.devinfo is not None and not is_true(self.devinfo.get("valid_data", True))
                           else constants.STATUSCODE_STARTUP)
 
+        self.polling_interval = self._get_polling_interval()
+
         # Create the mandatory objects
         self._dbusservice.add_path("/DeviceInstance", self.deviceinstance)
         self._dbusservice.add_path("/ProductId", 0xFFFF)  # id assigned by Victron Support from SDM630v2.py
         self._dbusservice.add_path("/ProductName", product_name)
         self._dbusservice.add_path("/CustomName", self._get_name())
         logging.info(f"Name of Inverters found: {self._get_name()}")
-        self._dbusservice.add_path("/Connected", 1)
+        connected = int(is_true(self.devinfo.get("valid_data"))) if self.devinfo else 1
+        self._dbusservice.add_path("/Connected", connected)
 
-        self._dbusservice.add_path("/Latency", None)
+        self._dbusservice.add_path("/Latency", self.polling_interval)
         self._dbusservice.add_path("/FirmwareVersion", firmware_version)
         self._dbusservice.add_path("/HardwareVersion", hardware_version)
         self._dbusservice.add_path("/Serial", self.serial)
@@ -162,10 +173,15 @@ class DbusService:
             self._dbusservice.add_path("/State", 9)
 
         # add path values to dbus
+        initial_overrides = {
+            "/Ac/MaxPower": initial_max_power,
+            "/Ac/PowerLimit": initial_power_limit,
+        }
         for path, settings in self._paths.items():
+            initial_value = initial_overrides.get(path, settings["initial"])
             self._dbusservice.add_path(
                 path,
-                settings["initial"],
+                initial_value,
                 gettextcallback=settings["textformat"],
                 writeable=True,
                 onchangecallback=self._handlechangedvalue,
@@ -173,12 +189,6 @@ class DbusService:
 
         self._dbusservice.register()
 
-        try:
-            self._refresh_limit_status()
-        except Exception as error:
-            logging.warning(f"Initial limit status fetch failed: {error}")
-
-        self.polling_interval = self._get_polling_interval()
         self.last_polling = 0
 
     @staticmethod
@@ -487,6 +497,31 @@ class DbusService:
             logging.warning(f"devinfo fetch failed: {error}")
             return None
 
+    def _fetch_limit_entry_safe(self):
+        '''OpenDTU only: one-shot /api/limit/status fetch for this inverter at startup.
+           Returns the per-serial entry dict or None on failure.'''
+        if self.dtuvariant != constants.DTUVARIANT_OPENDTU:
+            return None
+        try:
+            status = self.fetch_url(f"{self.get_opendtu_base_url()}/limit/status")
+            return status.get(self.serial)
+        except Exception as error:
+            logging.warning(f"limit status fetch failed: {error}")
+            return None
+
+    @staticmethod
+    def _initial_power_limit_from_entry(entry):
+        '''Derive (max_power, power_limit) pair from a /api/limit/status entry.
+           Either value may be None if the entry is missing or incomplete.'''
+        if not entry:
+            return (None, None)
+        max_power = entry.get("max_power")
+        limit_relative = entry.get("limit_relative")
+        power_limit = None
+        if max_power is not None and limit_relative is not None:
+            power_limit = max_power * float(limit_relative) / 100.0
+        return (max_power, power_limit)
+
     @staticmethod
     def _decode_version(value):
         '''Decode OpenDTU version fields. Strings pass through; ints are split into
@@ -510,9 +545,12 @@ class DbusService:
         return fw_ver or fw_dt
 
     def _refresh_limit_status(self):
-        '''OpenDTU only: fetch /api/limit/status, publish /Ac/MaxPower,
-           and mirror limit_set_status to /StatusCode. Returns the limit_set_status
-           string (or None) so callers can poll through a "Pending" phase.'''
+        '''OpenDTU only: fetch /api/limit/status and mirror limit_set_status to
+           /StatusCode. Returns the limit_set_status string (or None) so callers can
+           poll through a "Pending" phase. /Ac/MaxPower and /Ac/PowerLimit are seeded
+           at init via add_path; if that initial fetch failed, this function performs
+           a one-shot fallback seed (guarded by echo suppression in _handlechangedvalue
+           so the internal write doesn't round-trip back as a POST).'''
         if self.dtuvariant != constants.DTUVARIANT_OPENDTU:
             return None
         url = f"{self.get_opendtu_base_url()}/limit/status"
@@ -521,12 +559,15 @@ class DbusService:
         if not entry:
             logging.warning(f"No limit status entry for serial {self.serial}")
             return None
-        max_power = entry.get("max_power")
-        limit_relative = entry.get("limit_relative")
-        if max_power is not None:
-            self._dbusservice["/Ac/MaxPower"] = max_power
-            if limit_relative is not None and self._dbusservice["/Ac/PowerLimit"] is None:
-                self._dbusservice["/Ac/PowerLimit"] = max_power * float(limit_relative) / 100.0
+        if not getattr(self, "_limit_seeded", True):
+            # Mark seeded before writes so any re-entrant _refresh_limit_status (via
+            # onchangecallback -> _apply_power_limit -> _wait_for_limit_settled) skips.
+            self._limit_seeded = True
+            max_power, power_limit = self._initial_power_limit_from_entry(entry)
+            if max_power is not None:
+                self._dbusservice["/Ac/MaxPower"] = max_power
+            if power_limit is not None:
+                self._dbusservice["/Ac/PowerLimit"] = power_limit
         limit_set_status = entry.get("limit_set_status")
         if limit_set_status == "Ok":
             self._dbusservice["/StatusCode"] = constants.STATUSCODE_RUNNING
@@ -747,9 +788,29 @@ class DbusService:
         set to ERROR via _compute_status_code.
         """
         self._refresh_data()
+        self._publish_connected()
         self._handle_data_update()
         self._update_index()
         return True
+
+    def _publish_connected(self):
+        '''OpenDTU only: re-fetch devinfo and publish /Connected = 1 iff both
+           devinfo.valid_data and the livedata inverter.reachable flag are true.
+           self.devinfo is kept current so hardware metadata survives transient errors
+           (we only overwrite it on a successful fetch).'''
+        if self.dtuvariant != constants.DTUVARIANT_OPENDTU:
+            return
+        devinfo = self._fetch_devinfo_safe()
+        if devinfo is not None:
+            self.devinfo = devinfo
+        valid = is_true(self.devinfo.get("valid_data")) if self.devinfo else False
+        reachable = False
+        try:
+            meter_data = self._get_data()
+            reachable = is_true(meter_data["inverters"][self.pvinverternumber].get("reachable"))
+        except Exception as error:
+            logging.debug(f"reachable lookup failed: {error}")
+        self._dbusservice["/Connected"] = int(valid and reachable)
 
     def update(self):
         """

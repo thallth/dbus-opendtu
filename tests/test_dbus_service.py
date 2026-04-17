@@ -520,16 +520,50 @@ class PowerLimitTest(unittest.TestCase):
     @patch('dbus_service.dbus')
     @patch('dbus_service.logging')
     @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
-    def test_refresh_limit_status_publishes_max_power(
+    def test_init_seeds_max_power_and_power_limit_from_opendtu(
             self, mock_get, mock_logging, mock_dbus, mock_config):
-        """_refresh_limit_status populates /Ac/MaxPower and /Ac/PowerLimit."""
+        """At init, /Ac/MaxPower and /Ac/PowerLimit are seeded via add_path(initial=...)
+           from /api/limit/status, so no post-register writes emit PropertiesChanged."""
+        DbusService._meter_data = None
+        service = DbusService("com.victronenergy.pvinverter", 0)
+        by_path = {c.args[0]: c.args[1] for c in service._dbusservice.add_path.call_args_list}
+        self.assertEqual(by_path["/Ac/MaxPower"], 2000)
+        # limit_relative=50 and max_power=2000 -> 1000W initial PowerLimit
+        self.assertEqual(by_path["/Ac/PowerLimit"], 1000.0)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_refresh_limit_status_skips_seed_when_already_seeded(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """Once init (or a prior fallback) has seeded the paths, _refresh_limit_status
+           must not re-write them — that would round-trip via onchangecallback and POST."""
         DbusService._meter_data = None
         service = self._make_service()
+        service._limit_seeded = True
+        service._refresh_limit_status()
+        self.assertIsNone(service._dbusservice["/Ac/MaxPower"])
+        self.assertIsNone(service._dbusservice["/Ac/PowerLimit"])
+        # limit_set_status=Ok -> RUNNING (7)
+        self.assertEqual(service._dbusservice["/StatusCode"], 7)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    @patch('dbus_service.requests.get', side_effect=mocked_requests_get)
+    def test_refresh_limit_status_fallback_seeds_when_init_failed(
+            self, mock_get, mock_logging, mock_dbus, mock_config):
+        """If init's fetch failed, the first successful _refresh_limit_status seeds
+           /Ac/MaxPower and /Ac/PowerLimit and flips _limit_seeded so it fires once."""
+        DbusService._meter_data = None
+        service = self._make_service()
+        service._limit_seeded = False
         service._refresh_limit_status()
         self.assertEqual(service._dbusservice["/Ac/MaxPower"], 2000)
-        # limit_relative=50 and max_power=2000 -> 1000W initial PowerLimit
+        # limit_relative=50, max_power=2000 -> 1000W
         self.assertEqual(service._dbusservice["/Ac/PowerLimit"], 1000.0)
-        self.assertEqual(service._dbusservice["/StatusCode"], 7)
+        self.assertTrue(service._limit_seeded)
 
     @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
     @patch('dbus_service.dbus')
