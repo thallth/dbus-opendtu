@@ -40,8 +40,6 @@ STATUSCODE_ERROR = 10
 # Published directly in dbus_service.py __init__:
 #   /Position               0 = AC input 1, 1 = AC output, 2 = AC input 2
 #   /PositionIsAdjustable   0 = not adjustable, 1 = adjustable
-#   /NrOfPhases             int   Number of AC phases (1 or 3)
-#   /PhaseConfig            "1P" or "3P" — derived from config Phase
 #   /StatusCode             see STATUSCODE_* above
 #
 # Optional (not implemented here):

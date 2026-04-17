@@ -157,8 +157,6 @@ class DbusService:
         if servicename == "com.victronenergy.pvinverter":
             self._dbusservice.add_path("/Position", self.acposition)
             self._dbusservice.add_path("/PositionIsAdjustable", 1)
-            self._dbusservice.add_path("/NrOfPhases", 3 if self.pvinverterphase == "3P" else 1,)
-            self._dbusservice.add_path("/PhaseConfig", "3P" if self.pvinverterphase == "3P" else "1P")
 
         # If the Servicname is an (AC-)Inverter, add the Mode path (to show it as ON)
         # Also, we will set different paths and variables in the _update(self) method.
