@@ -818,11 +818,11 @@ class ComputeStatusCodeTest(unittest.TestCase):
         service.set_test_data({"inverters": [{"reachable": True, "producing": False}]})
         self.assertEqual(service._compute_status_code(), STATUSCODE_STANDBY)
 
-    def test_opendtu_unreachable_is_error(self):
-        from constants import STATUSCODE_ERROR
+    def test_opendtu_unreachable_is_standby(self):
+        from constants import STATUSCODE_STANDBY
         service = self._make("opendtu")
         service.set_test_data({"inverters": [{"reachable": False, "producing": False}]})
-        self.assertEqual(service._compute_status_code(), STATUSCODE_ERROR)
+        self.assertEqual(service._compute_status_code(), STATUSCODE_STANDBY)
 
 
 if __name__ == '__main__':

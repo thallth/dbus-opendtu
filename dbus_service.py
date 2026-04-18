@@ -738,18 +738,21 @@ class DbusService:
         return True
 
     def _compute_status_code(self):
-        '''Map inverter reachable/producing state onto STATUSCODE_* (7/8/10).'''
+        '''Map inverter reachable/producing state onto STATUSCODE_* (7/8/10).
+           OpenDTU reachable=false means the HTTP fetch succeeded but the
+           inverter itself is silent (typically night) -> Standby, not Error.
+           HTTP-failure paths still flag Error via set_dbus_values_to_zero().'''
         try:
-            if not self.is_data_up2date():
-                return constants.STATUSCODE_ERROR
             meter_data = self._get_data()
             if self.dtuvariant == constants.DTUVARIANT_OPENDTU:
                 inv = meter_data["inverters"][self.pvinverternumber]
                 if not is_true(inv.get("reachable")):
-                    return constants.STATUSCODE_ERROR
+                    return constants.STATUSCODE_STANDBY
                 if is_true(inv.get("producing")):
                     return constants.STATUSCODE_RUNNING
                 return constants.STATUSCODE_STANDBY
+            if not self.is_data_up2date():
+                return constants.STATUSCODE_ERROR
             if self.dtuvariant == constants.DTUVARIANT_AHOY:
                 power = get_ahoy_field_by_name(meter_data, self.pvinverternumber, "P_AC")
                 if power and float(power) > 0:
