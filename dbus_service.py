@@ -155,7 +155,7 @@ class DbusService:
         # devinfo.valid_data=false at startup already flags ERROR.
         self._dbusservice.add_path("/StatusCode", initial_status)
         if servicename == "com.victronenergy.pvinverter":
-            self._dbusservice.add_path("/Position", self.acposition)
+            self._dbusservice.add_path("/Position", self.acposition, writeable=True)
             self._dbusservice.add_path("/PositionIsAdjustable", 1)
 
         # If the Servicname is an (AC-)Inverter, add the Mode path (to show it as ON)
