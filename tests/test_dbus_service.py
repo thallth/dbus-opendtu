@@ -693,6 +693,54 @@ class PowerLimitTest(unittest.TestCase):
         by_path = {c.args[0]: c.args[1] for c in service._dbusservice.add_path.call_args_list}
         self.assertEqual(by_path["/StatusCode"], STATUSCODE_ERROR)
 
+    def test_normalize_devinfo_unwraps_pre_v23_4_17_shape(self):
+        """Pre-v23.4.17 OpenDTU ignores ?inv= and returns {serial: [devinfo]}; unwrap it."""
+        json_file_path = os.path.join(os.path.dirname(__file__), '../docs/opendtu_v23.3.27_devinfo_status.json')
+        with open(json_file_path, "r", encoding="UTF-8") as file:
+            legacy = json.load(file)
+        data = DbusService._normalize_devinfo(legacy, "114182940773")
+        self.assertTrue(data["valid_data"])
+        self.assertEqual(data["hw_model_name"], "HMS-2000-4T")
+        # Serial keys may be hex-formatted with different case
+        self.assertEqual(DbusService._normalize_devinfo({"ABC123": [{"valid_data": True}]}, "abc123"),
+                         {"valid_data": True})
+        # Detection is by serial key, not by absence of valid_data
+        self.assertEqual(DbusService._normalize_devinfo(
+            {"valid_data": False, "114182940773": [{"valid_data": True}]}, "114182940773"),
+            {"valid_data": True})
+        # Flat (current) shape passes through; unknown serial leaves data untouched
+        flat = {"valid_data": False}
+        self.assertIs(DbusService._normalize_devinfo(flat, "114182940773"), flat)
+        self.assertIs(DbusService._normalize_devinfo(legacy, "999"), legacy)
+
+    @patch('dbus_service.DbusService._get_config', return_value=opendtu_config)
+    @patch('dbus_service.dbus')
+    @patch('dbus_service.logging')
+    def test_connected_with_pre_v23_4_17_devinfo(
+            self, mock_logging, mock_dbus, mock_config):
+        """/Connected is 1 for a reachable inverter on firmware returning the legacy devinfo shape."""
+        json_file_path = os.path.join(os.path.dirname(__file__), '../docs/opendtu_v23.3.27_devinfo_status.json')
+        with open(json_file_path, "r", encoding="UTF-8") as file:
+            legacy = json.load(file)
+
+        def routed_get(url, **_kw):
+            if url.startswith("http://localhost/api/devinfo/status"):
+                response = MagicMock(status_code=200)
+                response.json.return_value = legacy
+                return response
+            return mocked_requests_get(url)
+
+        DbusService._meter_data = None
+        with patch('dbus_service.requests.get', side_effect=routed_get):
+            service = DbusService("com.victronenergy.pvinverter", 0)
+            by_path = {c.args[0]: c.args[1] for c in service._dbusservice.add_path.call_args_list}
+            self.assertEqual(by_path["/Connected"], 1)
+            self.assertEqual(by_path["/ProductName"], "HMS-2000-4T")
+            service._dbusservice.__setitem__ = MagicMock()
+            service._publish_connected()
+        # Inverter 0 is reachable in opendtu_v24.2.12_livedata_status.json
+        service._dbusservice.__setitem__.assert_called_with("/Connected", 1)
+
 
 class PvInverterSchemaTest(unittest.TestCase):
     """PVINVERTER_PATHS/VICTRON_PATHS separation and /Position + /PositionIsAdjustable."""
@@ -810,6 +858,39 @@ class OfflinePublishingTest(unittest.TestCase):
                     self.assertEqual(service._dbusservice[f"/Ac/{phase}/Voltage"], 0)
                 self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
                 self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_STANDBY)
+
+    def test_set_dbus_values_ahoy_ignores_stale_power(self):
+        """Regression: Ahoy data older than MaxAgeTsLastSuccess must not publish stale P_AC/I_AC,
+        but yield must still be published. max_age_ts < 0 disables the check."""
+        import time
+        cases = (
+            ("stale", 600, time.time() - 3600, 0, 0),
+            ("fresh", 600, time.time() - 10, 123.4, 0.5),
+            ("check_disabled", -1, time.time() - 3600, 123.4, 0.5),
+        )
+        for name, max_age_ts, ts_last_success, expected_power, expected_current in cases:
+            with self.subTest(case=name):
+                service = DbusService(servicename="testing", actual_inverter=0)
+                service.dtuvariant = "ahoy"
+                service._servicename = "com.victronenergy.pvinverter"
+                service.pvinverterphase = "L1"
+                service.useyieldday = False
+                service.dry_run = False
+                service.max_age_ts = max_age_ts
+                service.set_test_data({
+                    "ch0_fld_names": ["U_AC", "I_AC", "P_AC", "YieldTotal"],
+                    "fld_names": ["U_DC"],
+                    "inverter": [{
+                        "ts_last_success": ts_last_success,
+                        "ch": [[230.0, 0.5, 123.4, 12.345], [30.0]],
+                    }],
+                })
+                service._dbusservice = {}
+                service.set_dbus_values()
+                self.assertEqual(service._dbusservice["/Ac/Power"], expected_power)
+                self.assertEqual(service._dbusservice["/Ac/L1/Power"], expected_power)
+                self.assertEqual(service._dbusservice["/Ac/L1/Current"], expected_current)
+                self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
 
 
 class ComputeStatusCodeTest(unittest.TestCase):
