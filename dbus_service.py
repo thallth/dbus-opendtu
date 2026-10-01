@@ -143,7 +143,7 @@ class DbusService:
         self._dbusservice.add_path("/ProductName", product_name)
         self._dbusservice.add_path("/CustomName", self._get_name())
         logging.info(f"Name of Inverters found: {self._get_name()}")
-        connected = int(is_true(self.devinfo.get("valid_data"))) if self.devinfo else 1
+        connected = int(is_true(self.devinfo.get("valid_data", True))) if self.devinfo else 1
         self._dbusservice.add_path("/Connected", connected)
 
         self._dbusservice.add_path("/Latency", self.polling_interval)
@@ -492,7 +492,24 @@ class DbusService:
         '''Fetch device info (firmware/hardware metadata) from OpenDTU for one inverter.'''
         url = f"{self.get_opendtu_base_url()}/devinfo/status?inv={inverter_serial}"
         logging.debug(f"Devinfo URL: {url}")
-        return self.fetch_url(url)
+        return self._normalize_devinfo(self.fetch_url(url), inverter_serial)
+
+    @staticmethod
+    def _normalize_devinfo(data, inverter_serial):
+        '''Return the flat devinfo dict for one inverter. OpenDTU before v23.4.17 ignores
+           ?inv= and returns all inverters keyed by serial: {"<serial>": [{...}]}.'''
+        if not isinstance(data, dict):
+            return data
+        # A top-level key equal to the serial means ?inv= was ignored (old firmware).
+        # Old firmware may hex-format the serial with different case, so match case-insensitively.
+        wanted = str(inverter_serial).lower()
+        key = next((k for k in data if str(k).lower() == wanted), None)
+        if key is None:
+            return data
+        entry = data[key]
+        if isinstance(entry, list):
+            entry = entry[0] if entry else None
+        return entry if isinstance(entry, dict) else data
 
     def _fetch_devinfo_safe(self):
         '''OpenDTU only: one-shot devinfo fetch at startup. Returns dict or None on failure.'''
@@ -813,7 +830,8 @@ class DbusService:
         devinfo = self._fetch_devinfo_safe()
         if devinfo is not None:
             self.devinfo = devinfo
-        valid = is_true(self.devinfo.get("valid_data")) if self.devinfo else False
+        # Missing valid_data (unknown devinfo shape) is not proof of disconnection; rely on reachable
+        valid = is_true(self.devinfo.get("valid_data", True)) if self.devinfo else False
         reachable = False
         try:
             meter_data = self._get_data()
