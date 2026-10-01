@@ -791,6 +791,26 @@ class OfflinePublishingTest(unittest.TestCase):
         self.assertEqual(service._dbusservice["/Ac/Power"], 0)
         self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_STANDBY)
 
+    def test_set_dbus_values_three_phase_zero_voltage_when_offline(self):
+        """Regression: Phase=3P with AC voltage 0 at night must not raise ZeroDivisionError."""
+        from constants import STATUSCODE_STANDBY
+        for variant in ("opendtu", "ahoy"):
+            with self.subTest(dtuvariant=variant):
+                service = DbusService(servicename="testing", actual_inverter=0)
+                service.dtuvariant = variant
+                service._servicename = "com.victronenergy.pvinverter"
+                service.pvinverterphase = "3P"
+                service.dry_run = False
+                service.get_values_for_inverter = lambda: (0, 12.345, 0, 0, 0)
+                service._compute_status_code = lambda: STATUSCODE_STANDBY
+                service._dbusservice = {}
+                service.set_dbus_values()
+                for phase in ("L1", "L2", "L3"):
+                    self.assertEqual(service._dbusservice[f"/Ac/{phase}/Current"], 0)
+                    self.assertEqual(service._dbusservice[f"/Ac/{phase}/Voltage"], 0)
+                self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
+                self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_STANDBY)
+
 
 class ComputeStatusCodeTest(unittest.TestCase):
     """Tests for _compute_status_code mapping reachable/producing onto StatusCode."""
