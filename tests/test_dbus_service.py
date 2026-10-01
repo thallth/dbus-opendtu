@@ -752,8 +752,8 @@ class PvInverterSchemaTest(unittest.TestCase):
 
 
 class OfflinePublishingTest(unittest.TestCase):
-    """Regression: at night (OpenDTU reachable=false) yield totals and StatusCode=ERROR
-    must still be written to DBus, not skipped."""
+    """Regression: at night (OpenDTU reachable=false) yield totals and StatusCode=STANDBY
+    must still be written to DBus, not skipped. ERROR is reserved for HTTP-failure paths."""
 
     def setUp(self):
         DbusService._meter_data = None
@@ -761,8 +761,8 @@ class OfflinePublishingTest(unittest.TestCase):
     def tearDown(self):
         DbusService._meter_data = None
 
-    def test_set_dbus_values_publishes_yield_and_error_when_offline(self):
-        from constants import STATUSCODE_ERROR
+    def test_set_dbus_values_publishes_yield_and_standby_when_offline(self):
+        from constants import STATUSCODE_STANDBY
         service = DbusService(servicename="testing", actual_inverter=0)
         service.dtuvariant = "opendtu"
         service._servicename = "com.victronenergy.pvinverter"
@@ -789,7 +789,7 @@ class OfflinePublishingTest(unittest.TestCase):
         self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
         self.assertEqual(service._dbusservice["/Ac/L1/Energy/Forward"], 12.345)
         self.assertEqual(service._dbusservice["/Ac/Power"], 0)
-        self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_ERROR)
+        self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_STANDBY)
 
 
 class ComputeStatusCodeTest(unittest.TestCase):
