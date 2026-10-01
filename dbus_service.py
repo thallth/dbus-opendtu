@@ -942,6 +942,12 @@ class DbusService:
             voltage = get_ahoy_field_by_name(meter_data, self.pvinverternumber, "U_AC")
             dc_voltage = get_ahoy_field_by_name(meter_data, self.pvinverternumber, "U_DC", False)
             current = get_ahoy_field_by_name(meter_data, self.pvinverternumber, "I_AC")
+            # Ahoy keeps serving the last live values after the inverter goes silent.
+            # Honour MaxAgeTsLastSuccess: don't publish stale power/current (e.g. at night),
+            # cumulative yield is still published.
+            if not self.is_data_up2date():
+                power = 0
+                current = 0
 
         elif self.dtuvariant == constants.DTUVARIANT_OPENDTU:
             # OpenDTU v24.2.12 breaking API changes 2024-02-19

@@ -811,6 +811,39 @@ class OfflinePublishingTest(unittest.TestCase):
                 self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
                 self.assertEqual(service._dbusservice["/StatusCode"], STATUSCODE_STANDBY)
 
+    def test_set_dbus_values_ahoy_ignores_stale_power(self):
+        """Regression: Ahoy data older than MaxAgeTsLastSuccess must not publish stale P_AC/I_AC,
+        but yield must still be published. max_age_ts < 0 disables the check."""
+        import time
+        cases = (
+            ("stale", 600, time.time() - 3600, 0, 0),
+            ("fresh", 600, time.time() - 10, 123.4, 0.5),
+            ("check_disabled", -1, time.time() - 3600, 123.4, 0.5),
+        )
+        for name, max_age_ts, ts_last_success, expected_power, expected_current in cases:
+            with self.subTest(case=name):
+                service = DbusService(servicename="testing", actual_inverter=0)
+                service.dtuvariant = "ahoy"
+                service._servicename = "com.victronenergy.pvinverter"
+                service.pvinverterphase = "L1"
+                service.useyieldday = False
+                service.dry_run = False
+                service.max_age_ts = max_age_ts
+                service.set_test_data({
+                    "ch0_fld_names": ["U_AC", "I_AC", "P_AC", "YieldTotal"],
+                    "fld_names": ["U_DC"],
+                    "inverter": [{
+                        "ts_last_success": ts_last_success,
+                        "ch": [[230.0, 0.5, 123.4, 12.345], [30.0]],
+                    }],
+                })
+                service._dbusservice = {}
+                service.set_dbus_values()
+                self.assertEqual(service._dbusservice["/Ac/Power"], expected_power)
+                self.assertEqual(service._dbusservice["/Ac/L1/Power"], expected_power)
+                self.assertEqual(service._dbusservice["/Ac/L1/Current"], expected_current)
+                self.assertEqual(service._dbusservice["/Ac/Energy/Forward"], 12.345)
+
 
 class ComputeStatusCodeTest(unittest.TestCase):
     """Tests for _compute_status_code mapping reachable/producing onto StatusCode."""
