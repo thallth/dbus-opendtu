@@ -1063,7 +1063,7 @@ class DbusService:
                     singlePhaseVoltage = voltage
                     self._dbusservice["/Ac/Power"] = power
 
-                realCurrent = power / 3 / singlePhaseVoltage
+                realCurrent = power / 3 / singlePhaseVoltage if singlePhaseVoltage else 0
 
                 self._dbusservice["/Ac/L1/Voltage"] = singlePhaseVoltage
                 self._dbusservice["/Ac/L1/Current"] = realCurrent
